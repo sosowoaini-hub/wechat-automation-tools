@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地配置（含个人路径，不入库）
+config.json
+*.log
+
+# 临时素材 / 视频裁剪产物
+_prep/
+*.mp4
+
+# 系统
+.DS_Store
+Thumbs.db

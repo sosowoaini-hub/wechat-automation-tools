@@ -1,0 +1,78 @@
+diff --git a/bridge/wechat_bridge.py b/bridge/wechat_bridge.py
+index 7773efc..f2411fb 100644
+--- a/bridge/wechat_bridge.py
++++ b/bridge/wechat_bridge.py
+@@ -461,6 +461,23 @@ def main():
+ 
+     gui_box = {"gui": None}
+     send_lock = threading.Lock()
++
++    # 2026-11-25: 借鉴 WeChatAgent 的 timed_mutex——无超时的 Lock 一旦被卡死的
++    # 发送线程攥住，后面所有发送（含预热）永久阻塞，整个桥假死。改成带超时，
++    # 最多等 90 秒拿不到就放弃这一次，让看门狗/后续消息有机会继续。
++    import contextlib as _clib
++    class _SendLockTimeout(Exception):
++        pass
++
++    @_clib.contextmanager
++    def _send_guard(timeout=90):
++        if not send_lock.acquire(timeout=timeout):
++            log("发送锁等待 %ss 超时，跳过这次发送（疑似上次发送卡死）" % timeout)
++            raise _SendLockTimeout()
++        try:
++            yield
++        finally:
++            send_lock.release()
+     # 刚发出去的消息：同一个微信号，自己发的都会进库 ——
+     # 靠这个列表把「我们发的」跟「主人自己在手机上打的」区分开，不然会自问自答。
+     recently_sent = []
+@@ -1022,12 +1039,31 @@ def main():
+     # 兜底通道晚几秒醒来、或者拆条后隔了几十秒再补发，窗口一过就会重复发一遍
+     # （就是「老是发两次一模一样」）。这里用不过期的内存记录兜住。
+     _发过的段 = {}
++    # 2026-11-25: 借鉴 WeChatAgent 的持久化去重——内存记录重启就丢，
++    # 重启后兜底通道晚几秒醒来会把同一句重复发一遍。落到磁盘避免。
++    _dedup_file = os.path.join(os.path.expanduser("~"), ".dsh", "wx-sent-dedup.json")
++    try:
++        if os.path.exists(_dedup_file):
++            _d = json.load(open(_dedup_file, encoding="utf-8"))
++            _发过的段.update({k: float(v) for k, v in (_d or {}).items()
++                             if time.time() - float(v) <= 3600})
++    except Exception:
++        pass
+ 
+     def _记发过(text):
+         try:
+             k = clean_text(text)
+             if k:
+                 _发过的段[k] = time.time()
++                # 磁盘持久化（最多留500条，1小时过期）
++                try:
++                    _now = time.time()
++                    _data = {a: b for a, b in _发过的段.items() if _now - b <= 3600}
++                    if len(_data) > 500:
++                        _data = dict(sorted(_data.items(), key=lambda x: -x[1])[:500])
++                    json.dump(_data, open(_dedup_file, "w", encoding="utf-8"), ensure_ascii=False)
++                except Exception:
++                    pass
+         except Exception:
+             pass
+ 
+@@ -1344,7 +1380,7 @@ def main():
+             return {"ok": False, "说": "空消息"}
+         if not chat:
+             return {"ok": False, "说": "没指定发给谁（chat 空着）"}
+-        with send_lock:
++        with _send_guard():
+             # UIA 坏着的时候整条发送路都不许走：下面 _ensure_wechat_ready / open_chat /
+             # 读输入框都会进 wechatauto 的窗口操作，它一失败就退化成坐标盲点、
+             # 顺手最小化挡着的窗口 —— 队列里积着几条消息就是每秒两三次的空转。
+@@ -1731,7 +1767,7 @@ def main():
+         # 放在这里提前建好，免得真发消息时才闪那一下。
+         def _预热():
+             try:
+-                with send_lock:
++                with _send_guard():
+                     _取引擎()
+                 log("UIA 引擎预热完成")
+             except Exception as e:
